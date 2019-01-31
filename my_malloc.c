@@ -9,10 +9,13 @@ typedef struct free_list_node_t {
   struct free_list_node_t *pre;
 } free_node;
 
+
 static free_node *head = NULL;
+__thread free_node * multiThrhead = NULL;
 unsigned long data_segment_size = 0;
 unsigned long occupied_space_size = 0;
-
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t sbrk_mutex = PTHREAD_MUTEX_INITIALIZER;
 unsigned long get_data_segment_size() {
   return data_segment_size;
 }
@@ -68,7 +71,9 @@ void *splitAndMalloc(free_node *cur, size_t size) {
 void *incSizeAndMalloc(size_t size) {
   // printf("incSize for %lu", (unsigned long) size);
   // printf("program break now is %p\n", sbrk(0));
+  pthread_mutex_lock(&sbrk_mutex);
   free_node *newOccupiedNode = (free_node *) (sbrk(size + sizeof(free_node)));
+  pthread_mutex_unlock(&sbrk_mutex);
   newOccupiedNode->next = NULL;
   newOccupiedNode->pre = NULL;
   newOccupiedNode->size = size;
@@ -105,7 +110,7 @@ void traverseToFindtoFree(free_node *toFree) {
   }
 }
 
-void generalFree(free_node *toFree) {
+void free_lock(free_node *toFree) {
   occupied_space_size -= toFree->size;
   if (head == NULL) {
     head = toFree;
@@ -150,15 +155,14 @@ void merge(free_node *toMerge) {
   }
 }
 
-pthread_mutex_t mutex;
 
 void *ts_malloc_lock(size_t size) {
+  pthread_mutex_lock(&mutex);
   free_node *cur = head;
   void *res = NULL;
   free_node *minAvaiNode = NULL;
   unsigned long min = INT_MAX;
-  pthread_mutex_init(&mutex, NULL);
-  pthread_mutex_lock(&mutex);
+
   while (cur != NULL) {
     // printf("XXXXXXXXXXX");
     if (cur->size > size) {
@@ -182,14 +186,110 @@ void *ts_malloc_lock(size_t size) {
 }
 
 void ts_free_lock(void *ptr) {
+  pthread_mutex_lock(&mutex);
   free_node *toFree = (free_node *) ((char *) ptr - sizeof(free_node));
-  generalFree(toFree);
+  free_lock(toFree);
   merge(toFree);
+  pthread_mutex_unlock(&mutex);
+}
+
+
+/*--------------------------------------------------------------
+------------------------------------------------------------------*/
+
+
+void *splitButSmallSpace_nolock(free_node *cur, size_t size) {
+	//  printf("Can not split! size in call is %lu and cur->size is %lu\n", (unsigned long) size,
+	//   (unsigned long) cur->size);
+	if (cur == multiThrhead) {
+		if (cur->next != NULL) {
+			cur->next->pre = NULL;
+		}
+		multiThrhead = cur->next;
+	} else {
+		if (cur->pre != NULL) {
+			cur->pre->next = cur->next;
+		}
+		if (cur->next != NULL) {
+			cur->next->pre = cur->pre;
+		}
+	}
+	cur->next = NULL;
+	cur->pre = NULL;
+	occupied_space_size += cur->size;
+	return cur->addressForUser;
+}
+
+void *splitEnoughSpace_nolock(free_node *cur, size_t size) {
+	// printf("Can split! size in call is %lu and cur->size is %lu\n", (unsigned long)
+	// size, (unsigned long) cur->size);
+	free_node *newOccupiedNode = (free_node *) (cur->addressForUser + cur->size
+					      - size - sizeof(free_node));
+	newOccupiedNode->pre = NULL;
+	newOccupiedNode->next = NULL;
+	newOccupiedNode->size = size;
+	newOccupiedNode->addressForUser = (void *) newOccupiedNode + sizeof(free_node);
+	cur->size -= size + sizeof(free_node);
+	occupied_space_size += size;
+	return newOccupiedNode->addressForUser;
+}
+
+void *splitAndMalloc_nolock(free_node *cur, size_t size) {
+	if (cur->size <= size + sizeof(free_node)) { // Discard the so small part
+		return splitButSmallSpace_nolock(cur, size);
+	} else {
+		return splitEnoughSpace_nolock(cur, size);
+	}
+}
+
+void traverseToFindtoFree_nolock(free_node *toFree) {
+	free_node *cur = multiThrhead;
+	while (cur != NULL) {
+		// printf("Loooooooop");
+		if (cur->next != NULL) {
+			if ((unsigned long)cur->next > (unsigned long)toFree) {
+	break;
+			} else {
+	cur = cur->next;
+			}
+		} else {
+			break;
+		}
+	}
+	if (cur->next == NULL) {
+		cur->next = toFree;
+		toFree->pre = cur;
+		toFree->next = NULL;
+	} else {
+		toFree->next = cur->next;
+		toFree->pre = cur;
+		cur->next->pre = toFree;
+		cur->next = toFree;
+	}
+}
+
+void free_nolock(free_node *toFree) {
+	occupied_space_size -= toFree->size;
+	if (multiThrhead == NULL) {
+		multiThrhead = toFree;
+		multiThrhead->next = NULL;
+		multiThrhead->pre = NULL;
+		return;
+	}
+	if (multiThrhead > toFree) {
+		toFree->next = multiThrhead;
+		toFree->pre = NULL;
+		multiThrhead->pre = toFree;
+		multiThrhead = toFree;
+		return;
+	}
+	// Now toFree is behind multiThrhead
+	traverseToFindtoFree_nolock(toFree);
 }
 
 
 void *ts_malloc_nolock(size_t size) {
-  free_node *cur = head;
+  free_node *cur = multiThrhead;
   void *res = NULL;
   free_node *minAvaiNode = NULL;
   unsigned long min = INT_MAX;
@@ -209,7 +309,7 @@ void *ts_malloc_nolock(size_t size) {
   if (minAvaiNode == NULL) {
     res = incSizeAndMalloc(size);
   } else {
-    res = splitAndMalloc(minAvaiNode, size);
+    res = splitAndMalloc_nolock(minAvaiNode, size);
   }
   return res;
 }
@@ -217,6 +317,6 @@ void *ts_malloc_nolock(size_t size) {
 
 void ts_free_nolock(void *ptr) {
   free_node *toFree = (free_node *) ((char *) ptr - sizeof(free_node));
-  generalFree(toFree);
+  free_nolock(toFree);
   merge(toFree);
 }
