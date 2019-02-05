@@ -83,7 +83,6 @@ void *incSizeAndMalloc(size_t size) {
   return newOccupiedNode->addressForUser;
 }
 
-
 void traverseToFindtoFree(free_node *toFree) {
   free_node *cur = head;
   while (cur != NULL) {
